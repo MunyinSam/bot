@@ -15,10 +15,12 @@ FFMPEG_EXECUTABLE = os.getenv("FFMPEG_EXECUTABLE", "ffmpeg")
 
 db.init_db()
 
-# guild_id -> deque of {"title": str, "audio_url": str|None, "video_url": str}
+# guild_id -> deque of {"title": str, "audio_url": str|None, "video_url": str, "thumbnail": str|None}
 queues: dict[int, deque] = {}
-# guild_id -> title of the currently playing track
-now_playing: dict[int, str] = {}
+# guild_id -> full track dict of the currently playing track
+now_playing: dict[int, dict] = {}
+# guild_id -> text channel to send now-playing embeds to
+guild_text_channels: dict[int, discord.TextChannel] = {}
 
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -31,6 +33,19 @@ YDL_OPTIONS = {
     "youtube_include_dash_manifest": False,
     "youtube_include_hit_manifest": False,
 }
+
+
+def make_now_playing_embed(track: dict) -> discord.Embed:
+    """Build a Discord embed for the currently playing track."""
+    embed = discord.Embed(
+        title=track["title"],
+        url=track.get("video_url"),
+        color=discord.Color.blurple(),
+    )
+    embed.set_author(name="Now Playing \U0001f3b5")
+    if track.get("thumbnail"):
+        embed.set_image(url=track["thumbnail"])
+    return embed
 
 
 async def fetch_track(query_or_url: str) -> dict | None:
@@ -55,7 +70,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-async def play_next(guild: discord.Guild):
+async def play_next(guild: discord.Guild, send_notification: bool = True):
     """Play the next track in the guild's queue, or stop if empty."""
     vc = guild.voice_client
     queue = queues.get(guild.id)
@@ -74,8 +89,9 @@ async def play_next(guild: discord.Guild):
             await play_next(guild)  # skip unresolvable track
             return
         audio_url = info["url"]
+        track["thumbnail"] = info.get("thumbnail")  # grab thumbnail for playlist tracks
 
-    now_playing[guild.id] = track["title"]
+    now_playing[guild.id] = track  # store full track dict
     source = discord.FFmpegOpusAudio(
         audio_url, executable=FFMPEG_EXECUTABLE, **FFMPEG_OPTIONS
     )
@@ -87,6 +103,9 @@ async def play_next(guild: discord.Guild):
         asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop)
 
     vc.play(source, after=after_playing)
+
+    if send_notification and guild.id in guild_text_channels:
+        await guild_text_channels[guild.id].send(embed=make_now_playing_embed(track))
 
 
 # ── Bot events ────────────────────────────────────────────────────────────────
@@ -139,9 +158,11 @@ async def play(interaction: discord.Interaction, song_query: str):
         "title": title,
         "audio_url": info["url"],
         "video_url": info.get("webpage_url", song_query),
+        "thumbnail": info.get("thumbnail"),
     }
 
     guild_id = interaction.guild.id
+    guild_text_channels[guild_id] = interaction.channel
     if guild_id not in queues:
         queues[guild_id] = deque()
 
@@ -151,8 +172,8 @@ async def play(interaction: discord.Interaction, song_query: str):
     if already_active:
         await interaction.followup.send(f"Added to queue (#{len(queues[guild_id])}): **{title}**")
     else:
-        await play_next(interaction.guild)
-        await interaction.followup.send(f"Now playing: **{title}**")
+        await play_next(interaction.guild, send_notification=False)
+        await interaction.followup.send(embed=make_now_playing_embed(track))
 
 
 @bot.tree.command(name="skip", description="Skip the current song")
@@ -189,7 +210,7 @@ async def queue_cmd(interaction: discord.Interaction):
 
     lines = []
     if current:
-        lines.append(f"Now playing: **{current}**")
+        lines.append(f"Now playing: **{current['title']}**")
     if queue:
         lines.append(f"\nUp next ({len(queue)} song{'s' if len(queue) != 1 else ''}):")
         for i, track in enumerate(queue, start=1):
@@ -264,11 +285,12 @@ async def playlist_play(interaction: discord.Interaction, name: str):
         await voice_client.move_to(voice_channel)
 
     guild_id = interaction.guild.id
+    guild_text_channels[guild_id] = interaction.channel
     if guild_id not in queues:
         queues[guild_id] = deque()
 
     for song in songs:
-        queues[guild_id].append({"title": song["title"], "audio_url": None, "video_url": song["video_url"]})
+        queues[guild_id].append({"title": song["title"], "audio_url": None, "video_url": song["video_url"], "thumbnail": None})
 
     if not voice_client.is_playing():
         await play_next(interaction.guild)
