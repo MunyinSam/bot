@@ -48,6 +48,18 @@ def make_now_playing_embed(track: dict) -> discord.Embed:
     return embed
 
 
+def ok_embed(description: str) -> discord.Embed:
+    return discord.Embed(description=description, color=discord.Color.green())
+
+
+def info_embed(description: str, title: str = None) -> discord.Embed:
+    return discord.Embed(title=title, description=description, color=discord.Color.blurple())
+
+
+def err_embed(description: str) -> discord.Embed:
+    return discord.Embed(description=description, color=discord.Color.red())
+
+
 async def fetch_track(query_or_url: str) -> dict | None:
     """Resolve a search query or YouTube URL to a track info dict via yt-dlp."""
     loop = asyncio.get_running_loop()
@@ -127,7 +139,7 @@ async def on_ready():
 @bot.tree.command(name="sync_command", description="Sync latest commands")
 async def sync_command(interaction: discord.Interaction):
     await bot.tree.sync()
-    await interaction.response.send_message("Syncing New Commands")
+    await interaction.response.send_message(embed=ok_embed("Syncing new commands..."))
 
 
 @bot.tree.command(name="play", description="Play a song or add it to the queue")
@@ -136,7 +148,7 @@ async def play(interaction: discord.Interaction, song_query: str):
     await interaction.response.defer()
 
     if interaction.user.voice is None:
-        await interaction.followup.send("You are not in a voice channel.")
+        await interaction.followup.send(embed=err_embed("You are not in a voice channel."))
         return
 
     voice_channel = interaction.user.voice.channel
@@ -150,7 +162,7 @@ async def play(interaction: discord.Interaction, song_query: str):
     query = f"ytsearch1:{song_query}" if not song_query.startswith("http") else song_query
     info = await fetch_track(query)
     if info is None:
-        await interaction.followup.send("No results found.")
+        await interaction.followup.send(embed=err_embed("No results found."))
         return
 
     title = info.get("title", "Untitled")
@@ -170,7 +182,7 @@ async def play(interaction: discord.Interaction, song_query: str):
     already_active = voice_client.is_playing() or voice_client.is_paused() or len(queues[guild_id]) > 1
 
     if already_active:
-        await interaction.followup.send(f"Added to queue (#{len(queues[guild_id])}): **{title}**")
+        await interaction.followup.send(embed=info_embed(f"Added **{title}** to the queue at position #{len(queues[guild_id])}.", title="Added to Queue \U0001f3b6"))
     else:
         await play_next(interaction.guild, send_notification=False)
         await interaction.followup.send(embed=make_now_playing_embed(track))
@@ -180,10 +192,10 @@ async def play(interaction: discord.Interaction, song_query: str):
 async def skip(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc is None or not vc.is_playing():
-        await interaction.response.send_message("Nothing is playing right now.")
+        await interaction.response.send_message(embed=err_embed("Nothing is playing right now."))
         return
     vc.stop()  # triggers after_playing -> play_next
-    await interaction.response.send_message("Skipped.")
+    await interaction.response.send_message(embed=ok_embed("Skipped ⏭️"))
 
 
 @bot.tree.command(name="stop", description="Stop playback and clear the queue")
@@ -195,7 +207,7 @@ async def stop(interaction: discord.Interaction):
     if vc:
         vc.stop()
         await vc.disconnect()
-    await interaction.response.send_message("Stopped and cleared the queue.")
+    await interaction.response.send_message(embed=ok_embed("Stopped playback and cleared the queue. ⏹️"))
 
 
 @bot.tree.command(name="queue", description="Show the current queue")
@@ -205,18 +217,18 @@ async def queue_cmd(interaction: discord.Interaction):
     current = now_playing.get(guild_id)
 
     if not current and not queue:
-        await interaction.response.send_message("The queue is empty.")
+        await interaction.response.send_message(embed=info_embed("The queue is empty.", title="Queue"))
         return
 
     lines = []
     if current:
-        lines.append(f"Now playing: **{current['title']}**")
+        lines.append(f"\U0001f3b5 **Now playing:** {current['title']}")
     if queue:
-        lines.append(f"\nUp next ({len(queue)} song{'s' if len(queue) != 1 else ''}):")
+        lines.append(f"\n**Up next ({len(queue)} song{'s' if len(queue) != 1 else ''}):**")
         for i, track in enumerate(queue, start=1):
-            lines.append(f"{i}. {track['title']}")
+            lines.append(f"`{i}.` {track['title']}")
 
-    await interaction.response.send_message("\n".join(lines))
+    await interaction.response.send_message(embed=info_embed("\n".join(lines), title="Queue \U0001f4c4"))
 
 
 # ── Playlist commands ─────────────────────────────────────────────────────────
@@ -229,9 +241,9 @@ playlist_group = app_commands.Group(name="playlist", description="Manage saved p
 async def playlist_create(interaction: discord.Interaction, name: str):
     playlist_id = db.create_playlist(name, interaction.user.id, interaction.guild.id)
     if playlist_id is None:
-        await interaction.response.send_message(f"A playlist named **{name}** already exists in this server.")
+        await interaction.response.send_message(embed=err_embed(f"A playlist named **{name}** already exists in this server."))
     else:
-        await interaction.response.send_message(f"Playlist **{name}** created.")
+        await interaction.response.send_message(embed=ok_embed(f"Playlist **{name}** created. \U0001f3b5"))
 
 
 @playlist_group.command(name="add", description="Add a song to a playlist")
@@ -240,13 +252,13 @@ async def playlist_add(interaction: discord.Interaction, name: str, song_query: 
     await interaction.response.defer()
     playlist = db.get_playlist(name, interaction.guild.id)
     if playlist is None:
-        await interaction.followup.send(f"Playlist **{name}** not found.")
+        await interaction.followup.send(embed=err_embed(f"Playlist **{name}** not found."))
         return
 
     query = f"ytsearch1:{song_query}" if not song_query.startswith("http") else song_query
     info = await fetch_track(query)
     if info is None:
-        await interaction.followup.send("Could not find that song.")
+        await interaction.followup.send(embed=err_embed("Could not find that song."))
         return
 
     db.add_song(
@@ -255,7 +267,7 @@ async def playlist_add(interaction: discord.Interaction, name: str, song_query: 
         info.get("webpage_url", song_query),
         info.get("duration"),
     )
-    await interaction.followup.send(f"Added **{info.get('title', 'Untitled')}** to playlist **{name}**.")
+    await interaction.followup.send(embed=ok_embed(f"Added **{info.get('title', 'Untitled')}** to playlist **{name}**. \u2705"))
 
 
 @playlist_group.command(name="play", description="Load a playlist into the queue")
@@ -264,17 +276,17 @@ async def playlist_play(interaction: discord.Interaction, name: str):
     await interaction.response.defer()
 
     if interaction.user.voice is None:
-        await interaction.followup.send("You are not in a voice channel.")
+        await interaction.followup.send(embed=err_embed("You are not in a voice channel."))
         return
 
     playlist = db.get_playlist(name, interaction.guild.id)
     if playlist is None:
-        await interaction.followup.send(f"Playlist **{name}** not found.")
+        await interaction.followup.send(embed=err_embed(f"Playlist **{name}** not found."))
         return
 
     songs = db.get_songs(playlist["id"])
     if not songs:
-        await interaction.followup.send(f"Playlist **{name}** is empty.")
+        await interaction.followup.send(embed=err_embed(f"Playlist **{name}** is empty."))
         return
 
     voice_channel = interaction.user.voice.channel
@@ -295,19 +307,19 @@ async def playlist_play(interaction: discord.Interaction, name: str):
     if not voice_client.is_playing():
         await play_next(interaction.guild)
 
-    await interaction.followup.send(f"Loaded **{len(songs)}** songs from **{name}** into the queue.")
+    await interaction.followup.send(embed=ok_embed(f"Loaded **{len(songs)}** song{'s' if len(songs) != 1 else ''} from **{name}** into the queue. \U0001f4c2"))
 
 
 @playlist_group.command(name="list", description="List all playlists in this server")
 async def playlist_list(interaction: discord.Interaction):
     playlists = db.list_playlists(interaction.guild.id)
     if not playlists:
-        await interaction.response.send_message("No playlists found in this server.")
+        await interaction.response.send_message(embed=info_embed("No playlists found in this server.", title="Playlists"))
         return
-    lines = ["**Playlists:**"]
+    lines = []
     for p in playlists:
-        lines.append(f"- **{p['name']}** — {p['song_count']} song{'s' if p['song_count'] != 1 else ''}")
-    await interaction.response.send_message("\n".join(lines))
+        lines.append(f"\U0001f3b5 **{p['name']}** — {p['song_count']} song{'s' if p['song_count'] != 1 else ''}")
+    await interaction.response.send_message(embed=info_embed("\n".join(lines), title="Playlists \U0001f4c2"))
 
 
 @playlist_group.command(name="view", description="View songs in a playlist")
@@ -315,20 +327,20 @@ async def playlist_list(interaction: discord.Interaction):
 async def playlist_view(interaction: discord.Interaction, name: str):
     playlist = db.get_playlist(name, interaction.guild.id)
     if playlist is None:
-        await interaction.response.send_message(f"Playlist **{name}** not found.")
+        await interaction.response.send_message(embed=err_embed(f"Playlist **{name}** not found."))
         return
     songs = db.get_songs(playlist["id"])
     if not songs:
-        await interaction.response.send_message(f"Playlist **{name}** is empty.")
+        await interaction.response.send_message(embed=err_embed(f"Playlist **{name}** is empty."))
         return
-    lines = [f"**{name}** ({len(songs)} songs):"]
+    lines = []
     for s in songs:
         if s["duration"]:
             dur = f"{s['duration'] // 60}:{s['duration'] % 60:02d}"
         else:
             dur = "?:??"
-        lines.append(f"{s['position']}. {s['title']} [{dur}]")
-    await interaction.response.send_message("\n".join(lines))
+        lines.append(f"`{s['position']}.` {s['title']} `[{dur}]`")
+    await interaction.response.send_message(embed=info_embed("\n".join(lines), title=f"\U0001f3b5 {name} ({len(songs)} song{'s' if len(songs) != 1 else ''})"))
 
 
 @playlist_group.command(name="remove", description="Remove a song from a playlist by its position number")
@@ -336,13 +348,13 @@ async def playlist_view(interaction: discord.Interaction, name: str):
 async def playlist_remove(interaction: discord.Interaction, name: str, position: int):
     playlist = db.get_playlist(name, interaction.guild.id)
     if playlist is None:
-        await interaction.response.send_message(f"Playlist **{name}** not found.")
+        await interaction.response.send_message(embed=err_embed(f"Playlist **{name}** not found."))
         return
     removed = db.remove_song(playlist["id"], position)
     if removed:
-        await interaction.response.send_message(f"Removed song at position {position} from **{name}**.")
+        await interaction.response.send_message(embed=ok_embed(f"Removed song at position {position} from **{name}**. \u2705"))
     else:
-        await interaction.response.send_message(f"No song found at position {position}.")
+        await interaction.response.send_message(embed=err_embed(f"No song found at position {position}."))
 
 
 @playlist_group.command(name="delete", description="Delete a playlist you own")
@@ -350,13 +362,13 @@ async def playlist_remove(interaction: discord.Interaction, name: str, position:
 async def playlist_delete(interaction: discord.Interaction, name: str):
     playlist = db.get_playlist(name, interaction.guild.id)
     if playlist is None:
-        await interaction.response.send_message(f"Playlist **{name}** not found.")
+        await interaction.response.send_message(embed=err_embed(f"Playlist **{name}** not found."))
         return
     if playlist["owner_id"] != interaction.user.id:
-        await interaction.response.send_message("You can only delete playlists you created.")
+        await interaction.response.send_message(embed=err_embed("You can only delete playlists you created."))
         return
     db.delete_playlist(playlist["id"])
-    await interaction.response.send_message(f"Deleted playlist **{name}**.")
+    await interaction.response.send_message(embed=ok_embed(f"Deleted playlist **{name}**. \U0001f5d1"))
 
 
 bot.tree.add_command(playlist_group)
