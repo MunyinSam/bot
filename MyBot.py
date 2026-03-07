@@ -97,10 +97,10 @@ async def on_ready():
     await bot.tree.sync(guild=test_guild)
     print(f"{bot.user} is online")
 
-@bot.event
-async def on_message(msg):
-    if msg.author.id != bot.user.id:
-        await msg.channel.send(f"Message from {msg.author.mention}")
+# @bot.event
+# async def on_message(msg):
+#     if msg.author.id != bot.user.id:
+#         await msg.channel.send(f"Message from {msg.author.mention}")
 
 
 # ── Playback commands ─────────────────────────────────────────────────────────
