@@ -10,7 +10,7 @@ A Discord music bot that plays YouTube audio, manages a queue, and lets you save
 
 2. **Create a `.env` file** in the project root:
    ```
-   DISOCRD_TOKEN=your_discord_bot_token_here
+   DISCORD_TOKEN=your_discord_bot_token_here
    GUILD_ID=your_server_id_here
    ```
 
