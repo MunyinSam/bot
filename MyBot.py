@@ -11,6 +11,7 @@ import db
 load_dotenv()
 TOKEN = os.getenv("DISOCRD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
+FFMPEG_EXECUTABLE = os.getenv("FFMPEG_EXECUTABLE", "ffmpeg")
 
 db.init_db()
 
@@ -76,7 +77,7 @@ async def play_next(guild: discord.Guild):
 
     now_playing[guild.id] = track["title"]
     source = discord.FFmpegOpusAudio(
-        audio_url, executable="bin\\ffmpeg\\ffmpeg.exe", **FFMPEG_OPTIONS
+        audio_url, executable=FFMPEG_EXECUTABLE, **FFMPEG_OPTIONS
     )
 
     def after_playing(error):

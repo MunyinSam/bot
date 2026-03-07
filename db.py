@@ -1,7 +1,9 @@
 import sqlite3
+import os
 from contextlib import contextmanager
 
-DB_PATH = "bot.db"
+_data_dir = os.getenv("DATA_DIR", ".")
+DB_PATH = os.path.join(_data_dir, "bot.db")
 
 
 @contextmanager

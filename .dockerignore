@@ -1,0 +1,7 @@
+dc_env/
+bin/
+__pycache__/
+*.pyc
+*.db
+.env
+data/
