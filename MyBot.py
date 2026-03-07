@@ -9,7 +9,7 @@ from collections import deque
 import db
 
 load_dotenv()
-TOKEN = os.getenv("DISOCRD_TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
 FFMPEG_EXECUTABLE = os.getenv("FFMPEG_EXECUTABLE", "ffmpeg")
 
