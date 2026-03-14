@@ -5,7 +5,7 @@ services:
     volumes:
       - ./data:/app/data       # persists bot.db across restarts
     environment:
-      - DISOCRD_TOKEN=${DISOCRD_TOKEN}
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
       - GUILD_ID=${GUILD_ID}
       - DATA_DIR=/app/data
       - FFMPEG_EXECUTABLE=ffmpeg
