@@ -1,4 +1,5 @@
 import os
+import datetime as dt
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -6,75 +7,23 @@ from dotenv import load_dotenv
 import yt_dlp
 import asyncio
 from collections import deque
+from urllib.parse import urlparse, parse_qs
 import db
+from embeds import make_now_playing_embed, ok_embed, info_embed, err_embed
 
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")
-FFMPEG_EXECUTABLE = os.getenv("FFMPEG_EXECUTABLE", "ffmpeg")
+# Import Configs
+from config import TOKEN, GUILD_ID, FFMPEG_EXECUTABLE, FFMPEG_OPTIONS, YDL_OPTIONS
+
+
+# CONSTANTS
+
 
 db.init_db()
-
 # guild_id -> deque of {"title": str, "audio_url": str|None, "video_url": str, "thumbnail": str|None}
 queues: dict[int, deque] = {}
-# guild_id -> full track dict of the currently playing track
 now_playing: dict[int, dict] = {}
-# guild_id -> text channel to send now-playing embeds to
 guild_text_channels: dict[int, discord.TextChannel] = {}
-
-FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn -c:a libopus -b:a 96k",
-}
-
-YDL_OPTIONS = {
-    "format": "bestaudio[abr<=96]/bestaudio",
-    "noplaylist": True,
-    "youtube_include_dash_manifest": False,
-    "youtube_include_hit_manifest": False,
-}
-
-
-def make_now_playing_embed(track: dict) -> discord.Embed:
-    """Build a Discord embed for the currently playing track."""
-    embed = discord.Embed(
-        title=track["title"],
-        url=track.get("video_url"),
-        color=discord.Color.blurple(),
-    )
-    embed.set_author(name="Now Playing \U0001f3b5")
-    if track.get("thumbnail"):
-        embed.set_image(url=track["thumbnail"])
-    return embed
-
-
-def ok_embed(description: str) -> discord.Embed:
-    return discord.Embed(description=description, color=discord.Color.green())
-
-
-def info_embed(description: str, title: str = None) -> discord.Embed:
-    return discord.Embed(title=title, description=description, color=discord.Color.blurple())
-
-
-def err_embed(description: str) -> discord.Embed:
-    return discord.Embed(description=description, color=discord.Color.red())
-
-
-async def fetch_track(query_or_url: str) -> dict | None:
-    """Resolve a search query or YouTube URL to a track info dict via yt-dlp."""
-    loop = asyncio.get_running_loop()
-
-    def _extract():
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            result = ydl.extract_info(query_or_url, download=False)
-            if result is None:
-                return None
-            if "entries" in result:
-                return result["entries"][0] if result["entries"] else None
-            return result
-
-    return await loop.run_in_executor(None, _extract)
-
+daily_reminder_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -82,28 +31,92 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+# BOT LOGIC
+
+def _is_playlist_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+
+    if "playlist" in parsed.path.lower():
+        return True
+
+    query = parse_qs(parsed.query)
+    return bool(query.get("list"))
+
+
+def _to_track(info: dict, fallback_url: str) -> dict | None:
+    if not info:
+        return None
+
+    title = info.get("title") or "Untitled"
+    video_url = info.get("webpage_url") or info.get("original_url") or fallback_url
+    raw_audio_url = info.get("url")
+
+    # yt-dlp may return non-http placeholder values for playlist entries.
+    audio_url = raw_audio_url if isinstance(raw_audio_url, str) and raw_audio_url.startswith("http") else None
+
+    return {
+        "title": title,
+        "audio_url": audio_url,
+        "video_url": video_url,
+        "thumbnail": info.get("thumbnail"),
+    }
+
+
+async def fetch_tracks(query_or_url: str, allow_playlist: bool = False) -> tuple[list[dict], str | None, bool]:
+    loop = asyncio.get_running_loop()
+
+    def _extract():
+        options = dict(YDL_OPTIONS)
+        if allow_playlist:
+            options["noplaylist"] = False
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            result = ydl.extract_info(query_or_url, download=False)
+            if result is None:
+                return [], None, False
+
+            if "entries" in result:
+                tracks = []
+                for entry in result["entries"]:
+                    track = _to_track(entry, query_or_url)
+                    if track is not None:
+                        tracks.append(track)
+                return tracks, result.get("title"), len(tracks) > 1
+
+            single = _to_track(result, query_or_url)
+            return ([single] if single else []), None, False
+        
+    return await loop.run_in_executor(None, _extract)
+
 async def play_next(guild: discord.Guild, send_notification: bool = True):
-    """Play the next track in the guild's queue, or stop if empty."""
     vc = guild.voice_client
     queue = queues.get(guild.id)
 
+    # If nothing is going on
     if not queue or not vc or vc.is_playing():
         now_playing.pop(guild.id, None)
         return
-
+    
     track = queue.popleft()
     audio_url = track.get("audio_url")
 
     if not audio_url:
-        # Resolve stored YouTube URL to a fresh audio stream
-        info = await fetch_track(track["video_url"])
-        if info is None:
-            await play_next(guild)  # skip unresolvable track
+        tracks, _, _ = await fetch_tracks(track["video_url"])
+        if not tracks:
+            await play_next(guild) # skip broken track
             return
-        audio_url = info["url"]
-        track["thumbnail"] = info.get("thumbnail")  # grab thumbnail for playlist tracks
+        refreshed = tracks[0]
+        audio_url = refreshed.get("audio_url")
+        track["thumbnail"] = refreshed.get("thumbnail") # for picture
 
-    now_playing[guild.id] = track  # store full track dict
+        if not audio_url:
+            await play_next(guild)
+            return
+    
+    now_playing[guild.id] = track # store full track dict
     source = discord.FFmpegOpusAudio(
         audio_url, executable=FFMPEG_EXECUTABLE, **FFMPEG_OPTIONS
     )
@@ -112,12 +125,46 @@ async def play_next(guild: discord.Guild, send_notification: bool = True):
         if error:
             print(f"Playback error: {error}")
         now_playing.pop(guild.id, None)
-        asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop)
+        asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop) # make new thread calling next
 
-    vc.play(source, after=after_playing)
+    # Bot Play Music HERE
+    vc.play(source, after=after_playing) 
 
     if send_notification and guild.id in guild_text_channels:
         await guild_text_channels[guild.id].send(embed=make_now_playing_embed(track))
+
+
+def parse_daily_time(time_text: str) -> tuple[int, int] | None:
+    parts = time_text.strip().split(":")
+    if len(parts) != 2:
+        return None
+    if not parts[0].isdigit() or not parts[1].isdigit():
+        return None
+
+    hour = int(parts[0])
+    minute = int(parts[1])
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+
+    return hour, minute
+
+
+def seconds_until_next_run(hour: int, minute: int) -> float:
+    now = dt.datetime.now()
+    next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if next_run <= now:
+        next_run += dt.timedelta(days=1)
+    return (next_run - now).total_seconds()
+
+
+async def daily_reminder_loop(channel: discord.abc.Messageable, user_id: int, reminder_text: str, hour: int, minute: int):
+    while True:
+        await asyncio.sleep(seconds_until_next_run(hour, minute))
+        try:
+            await channel.send(embed=info_embed(f"<@{user_id}> {reminder_text}", title="Daily Reminder \u23f0"))
+        except (discord.Forbidden, discord.HTTPException):
+            # Keep the loop alive; the channel may become available again later.
+            continue
 
 
 # ── Bot events ────────────────────────────────────────────────────────────────
@@ -128,22 +175,15 @@ async def on_ready():
     await bot.tree.sync(guild=test_guild)
     print(f"{bot.user} is online")
 
-# @bot.event
-# async def on_message(msg):
-#     if msg.author.id != bot.user.id:
-#         await msg.channel.send(f"Message from {msg.author.mention}")
-
-
 # ── Playback commands ─────────────────────────────────────────────────────────
 
-@bot.tree.command(name="sync_command", description="Sync latest commands")
+@bot.tree.command(name="sync_command", description="Sync lastest commands")
 async def sync_command(interaction: discord.Interaction):
     await bot.tree.sync()
     await interaction.response.send_message(embed=ok_embed("Syncing new commands..."))
 
-
 @bot.tree.command(name="play", description="Play a song or add it to the queue")
-@app_commands.describe(song_query="Song name or YouTube URL")
+@app_commands.describe(song_query="Song Name or Youtube URL")
 async def play(interaction: discord.Interaction, song_query: str):
     await interaction.response.defer()
 
@@ -158,35 +198,50 @@ async def play(interaction: discord.Interaction, song_query: str):
         voice_client = await voice_channel.connect()
     elif voice_channel != voice_client.channel:
         await voice_client.move_to(voice_channel)
+    
+    is_url = song_query.startswith("http")
+    query = f"ytsearch1:{song_query}" if not is_url else song_query
+    allow_playlist = is_url and _is_playlist_url(song_query)
 
-    query = f"ytsearch1:{song_query}" if not song_query.startswith("http") else song_query
-    info = await fetch_track(query)
-    if info is None:
+    tracks, playlist_title, is_playlist = await fetch_tracks(query, allow_playlist=allow_playlist)
+    if not tracks:
         await interaction.followup.send(embed=err_embed("No results found."))
         return
-
-    title = info.get("title", "Untitled")
-    track = {
-        "title": title,
-        "audio_url": info["url"],
-        "video_url": info.get("webpage_url", song_query),
-        "thumbnail": info.get("thumbnail"),
-    }
 
     guild_id = interaction.guild.id
     guild_text_channels[guild_id] = interaction.channel
     if guild_id not in queues:
         queues[guild_id] = deque()
 
-    queues[guild_id].append(track)
-    already_active = voice_client.is_playing() or voice_client.is_paused() or len(queues[guild_id]) > 1
+    already_active = voice_client.is_playing() or voice_client.is_paused() or len(queues[guild_id]) > 0
+    for track in tracks:
+        queues[guild_id].append(track)
 
     if already_active:
-        await interaction.followup.send(embed=info_embed(f"Added **{title}** to the queue at position #{len(queues[guild_id])}.", title="Added to Queue \U0001f3b6"))
+        if is_playlist:
+            title = playlist_title or "Playlist"
+            await interaction.followup.send(
+                embed=info_embed(
+                    f"Added **{len(tracks)}** tracks from **{title}** to the queue.",
+                    title="Added Playlist to Queue \U0001f3b6",
+                )
+            )
+        else:
+            title = tracks[0]["title"]
+            position = len(queues[guild_id])
+            await interaction.followup.send(
+                embed=info_embed(
+                    f"Added **{title}** to the queue at position #{position}.",
+                    title="Added to Queue \U0001f3b6",
+                )
+            )
     else:
         await play_next(interaction.guild, send_notification=False)
-        await interaction.followup.send(embed=make_now_playing_embed(track))
-
+        current = now_playing.get(guild_id)
+        if current:
+            await interaction.followup.send(embed=make_now_playing_embed(current))
+        else:
+            await interaction.followup.send(embed=err_embed("Could not start playback."))
 
 @bot.tree.command(name="skip", description="Skip the current song")
 async def skip(interaction: discord.Interaction):
@@ -196,7 +251,6 @@ async def skip(interaction: discord.Interaction):
         return
     vc.stop()  # triggers after_playing -> play_next
     await interaction.response.send_message(embed=ok_embed("Skipped ⏭️"))
-
 
 @bot.tree.command(name="stop", description="Stop playback and clear the queue")
 async def stop(interaction: discord.Interaction):
@@ -208,7 +262,6 @@ async def stop(interaction: discord.Interaction):
         vc.stop()
         await vc.disconnect()
     await interaction.response.send_message(embed=ok_embed("Stopped playback and cleared the queue. ⏹️"))
-
 
 @bot.tree.command(name="queue", description="Show the current queue")
 async def queue_cmd(interaction: discord.Interaction):
@@ -231,145 +284,40 @@ async def queue_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=info_embed("\n".join(lines), title="Queue \U0001f4c4"))
 
 
-# ── Playlist commands ─────────────────────────────────────────────────────────
-
-playlist_group = app_commands.Group(name="playlist", description="Manage saved playlists")
-
-
-@playlist_group.command(name="create", description="Create a new playlist")
-@app_commands.describe(name="Playlist name")
-async def playlist_create(interaction: discord.Interaction, name: str):
-    playlist_id = db.create_playlist(name, interaction.user.id, interaction.guild.id)
-    if playlist_id is None:
-        await interaction.response.send_message(embed=err_embed(f"A playlist named **{name}** already exists in this server."))
-    else:
-        await interaction.response.send_message(embed=ok_embed(f"Playlist **{name}** created. \U0001f3b5"))
-
-
-@playlist_group.command(name="add", description="Add a song to a playlist")
-@app_commands.describe(name="Playlist name", song_query="Song name or YouTube URL")
-async def playlist_add(interaction: discord.Interaction, name: str, song_query: str):
-    await interaction.response.defer()
-    playlist = db.get_playlist(name, interaction.guild.id)
-    if playlist is None:
-        await interaction.followup.send(embed=err_embed(f"Playlist **{name}** not found."))
+@bot.tree.command(name="reminder", description="Set a daily reminder")
+@app_commands.describe(
+    reminder="What should I remind you about?",
+    time="Daily time in HH:MM (24-hour), for example 09:30",
+)
+async def reminder(interaction: discord.Interaction, reminder: str, time: str):
+    parsed_time = parse_daily_time(time)
+    if parsed_time is None:
+        await interaction.response.send_message(
+            embed=err_embed("Invalid time format. Use HH:MM in 24-hour format, for example 09:30."),
+            ephemeral=True,
+        )
         return
 
-    query = f"ytsearch1:{song_query}" if not song_query.startswith("http") else song_query
-    info = await fetch_track(query)
-    if info is None:
-        await interaction.followup.send(embed=err_embed("Could not find that song."))
+    if interaction.channel is None or interaction.channel_id is None:
+        await interaction.response.send_message(embed=err_embed("I could not find a channel for this reminder."), ephemeral=True)
         return
 
-    db.add_song(
-        playlist["id"],
-        info.get("title", "Untitled"),
-        info.get("webpage_url", song_query),
-        info.get("duration"),
+    hour, minute = parsed_time
+    task_key = (interaction.user.id, interaction.channel_id)
+
+    existing_task = daily_reminder_tasks.pop(task_key, None)
+    if existing_task:
+        existing_task.cancel()
+
+    task = asyncio.create_task(
+        daily_reminder_loop(interaction.channel, interaction.user.id, reminder, hour, minute)
     )
-    await interaction.followup.send(embed=ok_embed(f"Added **{info.get('title', 'Untitled')}** to playlist **{name}**. \u2705"))
+    daily_reminder_tasks[task_key] = task
+
+    await interaction.response.send_message(
+        embed=ok_embed(f"Daily reminder saved for **{time}**: {reminder}"),
+        ephemeral=True,
+    )
 
 
-@playlist_group.command(name="play", description="Load a playlist into the queue")
-@app_commands.describe(name="Playlist name")
-async def playlist_play(interaction: discord.Interaction, name: str):
-    await interaction.response.defer()
-
-    if interaction.user.voice is None:
-        await interaction.followup.send(embed=err_embed("You are not in a voice channel."))
-        return
-
-    playlist = db.get_playlist(name, interaction.guild.id)
-    if playlist is None:
-        await interaction.followup.send(embed=err_embed(f"Playlist **{name}** not found."))
-        return
-
-    songs = db.get_songs(playlist["id"])
-    if not songs:
-        await interaction.followup.send(embed=err_embed(f"Playlist **{name}** is empty."))
-        return
-
-    voice_channel = interaction.user.voice.channel
-    voice_client = interaction.guild.voice_client
-    if voice_client is None:
-        voice_client = await voice_channel.connect()
-    elif voice_channel != voice_client.channel:
-        await voice_client.move_to(voice_channel)
-
-    guild_id = interaction.guild.id
-    guild_text_channels[guild_id] = interaction.channel
-    if guild_id not in queues:
-        queues[guild_id] = deque()
-
-    for song in songs:
-        queues[guild_id].append({"title": song["title"], "audio_url": None, "video_url": song["video_url"], "thumbnail": None})
-
-    if not voice_client.is_playing():
-        await play_next(interaction.guild)
-
-    await interaction.followup.send(embed=ok_embed(f"Loaded **{len(songs)}** song{'s' if len(songs) != 1 else ''} from **{name}** into the queue. \U0001f4c2"))
-
-
-@playlist_group.command(name="list", description="List all playlists in this server")
-async def playlist_list(interaction: discord.Interaction):
-    playlists = db.list_playlists(interaction.guild.id)
-    if not playlists:
-        await interaction.response.send_message(embed=info_embed("No playlists found in this server.", title="Playlists"))
-        return
-    lines = []
-    for p in playlists:
-        lines.append(f"\U0001f3b5 **{p['name']}** — {p['song_count']} song{'s' if p['song_count'] != 1 else ''}")
-    await interaction.response.send_message(embed=info_embed("\n".join(lines), title="Playlists \U0001f4c2"))
-
-
-@playlist_group.command(name="view", description="View songs in a playlist")
-@app_commands.describe(name="Playlist name")
-async def playlist_view(interaction: discord.Interaction, name: str):
-    playlist = db.get_playlist(name, interaction.guild.id)
-    if playlist is None:
-        await interaction.response.send_message(embed=err_embed(f"Playlist **{name}** not found."))
-        return
-    songs = db.get_songs(playlist["id"])
-    if not songs:
-        await interaction.response.send_message(embed=err_embed(f"Playlist **{name}** is empty."))
-        return
-    lines = []
-    for s in songs:
-        if s["duration"]:
-            dur = f"{s['duration'] // 60}:{s['duration'] % 60:02d}"
-        else:
-            dur = "?:??"
-        lines.append(f"`{s['position']}.` {s['title']} `[{dur}]`")
-    await interaction.response.send_message(embed=info_embed("\n".join(lines), title=f"\U0001f3b5 {name} ({len(songs)} song{'s' if len(songs) != 1 else ''})"))
-
-
-@playlist_group.command(name="remove", description="Remove a song from a playlist by its position number")
-@app_commands.describe(name="Playlist name", position="Position number shown in /playlist view")
-async def playlist_remove(interaction: discord.Interaction, name: str, position: int):
-    playlist = db.get_playlist(name, interaction.guild.id)
-    if playlist is None:
-        await interaction.response.send_message(embed=err_embed(f"Playlist **{name}** not found."))
-        return
-    removed = db.remove_song(playlist["id"], position)
-    if removed:
-        await interaction.response.send_message(embed=ok_embed(f"Removed song at position {position} from **{name}**. \u2705"))
-    else:
-        await interaction.response.send_message(embed=err_embed(f"No song found at position {position}."))
-
-
-@playlist_group.command(name="delete", description="Delete a playlist you own")
-@app_commands.describe(name="Playlist name")
-async def playlist_delete(interaction: discord.Interaction, name: str):
-    playlist = db.get_playlist(name, interaction.guild.id)
-    if playlist is None:
-        await interaction.response.send_message(embed=err_embed(f"Playlist **{name}** not found."))
-        return
-    if playlist["owner_id"] != interaction.user.id:
-        await interaction.response.send_message(embed=err_embed("You can only delete playlists you created."))
-        return
-    db.delete_playlist(playlist["id"])
-    await interaction.response.send_message(embed=ok_embed(f"Deleted playlist **{name}**. \U0001f5d1"))
-
-
-bot.tree.add_command(playlist_group)
 bot.run(TOKEN)
