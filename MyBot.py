@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import yt_dlp
 import asyncio
 from collections import deque
+from urllib.parse import urlparse, parse_qs
 import db
 from embeds import make_now_playing_embed, ok_embed, info_embed, err_embed
 
@@ -32,17 +33,61 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # BOT LOGIC
 
-async def fetch_tract(query_or_url: str) -> dict | None:
+def _is_playlist_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+
+    if "playlist" in parsed.path.lower():
+        return True
+
+    query = parse_qs(parsed.query)
+    return bool(query.get("list"))
+
+
+def _to_track(info: dict, fallback_url: str) -> dict | None:
+    if not info:
+        return None
+
+    title = info.get("title") or "Untitled"
+    video_url = info.get("webpage_url") or info.get("original_url") or fallback_url
+    raw_audio_url = info.get("url")
+
+    # yt-dlp may return non-http placeholder values for playlist entries.
+    audio_url = raw_audio_url if isinstance(raw_audio_url, str) and raw_audio_url.startswith("http") else None
+
+    return {
+        "title": title,
+        "audio_url": audio_url,
+        "video_url": video_url,
+        "thumbnail": info.get("thumbnail"),
+    }
+
+
+async def fetch_tracks(query_or_url: str, allow_playlist: bool = False) -> tuple[list[dict], str | None, bool]:
     loop = asyncio.get_running_loop()
 
     def _extract():
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+        options = dict(YDL_OPTIONS)
+        if allow_playlist:
+            options["noplaylist"] = False
+
+        with yt_dlp.YoutubeDL(options) as ydl:
             result = ydl.extract_info(query_or_url, download=False)
             if result is None:
-                return None
+                return [], None, False
+
             if "entries" in result:
-                return result["entries"][0] if result["entries"] else None
-            return result
+                tracks = []
+                for entry in result["entries"]:
+                    track = _to_track(entry, query_or_url)
+                    if track is not None:
+                        tracks.append(track)
+                return tracks, result.get("title"), len(tracks) > 1
+
+            single = _to_track(result, query_or_url)
+            return ([single] if single else []), None, False
         
     return await loop.run_in_executor(None, _extract)
 
@@ -59,12 +104,17 @@ async def play_next(guild: discord.Guild, send_notification: bool = True):
     audio_url = track.get("audio_url")
 
     if not audio_url:
-        info = await fetch_tract(track["video_url"])
-        if info is None:
+        tracks, _, _ = await fetch_tracks(track["video_url"])
+        if not tracks:
             await play_next(guild) # skip broken track
             return
-        audio_url = info["url"]
-        track["thumbnail"] = info.get("thumbnail") # for picture
+        refreshed = tracks[0]
+        audio_url = refreshed.get("audio_url")
+        track["thumbnail"] = refreshed.get("thumbnail") # for picture
+
+        if not audio_url:
+            await play_next(guild)
+            return
     
     now_playing[guild.id] = track # store full track dict
     source = discord.FFmpegOpusAudio(
@@ -149,33 +199,49 @@ async def play(interaction: discord.Interaction, song_query: str):
     elif voice_channel != voice_client.channel:
         await voice_client.move_to(voice_channel)
     
-    query = f"ytsearch1:{song_query}" if not song_query.startswith("http") else song_query
-    info = await fetch_track(query)
-    if info is None:
+    is_url = song_query.startswith("http")
+    query = f"ytsearch1:{song_query}" if not is_url else song_query
+    allow_playlist = is_url and _is_playlist_url(song_query)
+
+    tracks, playlist_title, is_playlist = await fetch_tracks(query, allow_playlist=allow_playlist)
+    if not tracks:
         await interaction.followup.send(embed=err_embed("No results found."))
         return
-
-    title = info.get("title", "Untitled")
-    track = {
-        "title": title,
-        "audio_url": info["url"],
-        "video_url": info.get("webpage_url", song_query),
-        "thumbnail": info.get("thumbnail"),
-    }
 
     guild_id = interaction.guild.id
     guild_text_channels[guild_id] = interaction.channel
     if guild_id not in queues:
         queues[guild_id] = deque()
 
-    queues[guild_id].append(track)
-    already_active = voice_client.is_playing() or voice_client.is_paused() or len(queues[guild_id]) > 1
+    already_active = voice_client.is_playing() or voice_client.is_paused() or len(queues[guild_id]) > 0
+    for track in tracks:
+        queues[guild_id].append(track)
 
     if already_active:
-        await interaction.followup.send(embed=info_embed(f"Added **{title}** to the queue at position #{len(queues[guild_id])}.", title="Added to Queue \U0001f3b6"))
+        if is_playlist:
+            title = playlist_title or "Playlist"
+            await interaction.followup.send(
+                embed=info_embed(
+                    f"Added **{len(tracks)}** tracks from **{title}** to the queue.",
+                    title="Added Playlist to Queue \U0001f3b6",
+                )
+            )
+        else:
+            title = tracks[0]["title"]
+            position = len(queues[guild_id])
+            await interaction.followup.send(
+                embed=info_embed(
+                    f"Added **{title}** to the queue at position #{position}.",
+                    title="Added to Queue \U0001f3b6",
+                )
+            )
     else:
         await play_next(interaction.guild, send_notification=False)
-        await interaction.followup.send(embed=make_now_playing_embed(track))
+        current = now_playing.get(guild_id)
+        if current:
+            await interaction.followup.send(embed=make_now_playing_embed(current))
+        else:
+            await interaction.followup.send(embed=err_embed("Could not start playback."))
 
 @bot.tree.command(name="skip", description="Skip the current song")
 async def skip(interaction: discord.Interaction):
@@ -252,7 +318,6 @@ async def reminder(interaction: discord.Interaction, reminder: str, time: str):
         embed=ok_embed(f"Daily reminder saved for **{time}**: {reminder}"),
         ephemeral=True,
     )
-
 
 
 bot.run(TOKEN)
