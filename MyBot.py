@@ -5,6 +5,7 @@ from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 import yt_dlp
+from yt_dlp.utils import DownloadError
 import asyncio
 from collections import deque
 from urllib.parse import urlparse, parse_qs
@@ -65,29 +66,39 @@ def _to_track(info: dict, fallback_url: str) -> dict | None:
     }
 
 
-async def fetch_tracks(query_or_url: str, allow_playlist: bool = False) -> tuple[list[dict], str | None, bool]:
+async def fetch_tracks(query_or_url: str, allow_playlist: bool = False) -> tuple[list[dict], str | None, bool, int, str | None]:
     loop = asyncio.get_running_loop()
 
     def _extract():
         options = dict(YDL_OPTIONS)
         if allow_playlist:
             options["noplaylist"] = False
+            options["ignoreerrors"] = True
 
-        with yt_dlp.YoutubeDL(options) as ydl:
-            result = ydl.extract_info(query_or_url, download=False)
-            if result is None:
-                return [], None, False
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                result = ydl.extract_info(query_or_url, download=False)
+        except DownloadError as exc:
+            return [], None, False, 0, str(exc)
+        except Exception as exc:
+            return [], None, False, 0, str(exc)
 
-            if "entries" in result:
-                tracks = []
-                for entry in result["entries"]:
-                    track = _to_track(entry, query_or_url)
-                    if track is not None:
-                        tracks.append(track)
-                return tracks, result.get("title"), len(tracks) > 1
+        if result is None:
+            return [], None, False, 0, None
 
-            single = _to_track(result, query_or_url)
-            return ([single] if single else []), None, False
+        if "entries" in result:
+            tracks = []
+            skipped = 0
+            for entry in result["entries"] or []:
+                track = _to_track(entry, query_or_url)
+                if track is None:
+                    skipped += 1
+                    continue
+                tracks.append(track)
+            return tracks, result.get("title"), len(tracks) > 1, skipped, None
+
+        single = _to_track(result, query_or_url)
+        return ([single] if single else []), None, False, (0 if single else 1), None
         
     return await loop.run_in_executor(None, _extract)
 
@@ -104,7 +115,7 @@ async def play_next(guild: discord.Guild, send_notification: bool = True):
     audio_url = track.get("audio_url")
 
     if not audio_url:
-        tracks, _, _ = await fetch_tracks(track["video_url"])
+        tracks, _, _, _, _ = await fetch_tracks(track["video_url"])
         if not tracks:
             await play_next(guild) # skip broken track
             return
@@ -203,9 +214,14 @@ async def play(interaction: discord.Interaction, song_query: str):
     query = f"ytsearch1:{song_query}" if not is_url else song_query
     allow_playlist = is_url and _is_playlist_url(song_query)
 
-    tracks, playlist_title, is_playlist = await fetch_tracks(query, allow_playlist=allow_playlist)
+    tracks, playlist_title, is_playlist, skipped_count, fetch_error = await fetch_tracks(query, allow_playlist=allow_playlist)
     if not tracks:
-        await interaction.followup.send(embed=err_embed("No results found."))
+        if fetch_error and ("confirm your age" in fetch_error.lower() or "sign in" in fetch_error.lower()):
+            await interaction.followup.send(
+                embed=err_embed("That video/playlist contains age-restricted content. I cannot access it without YouTube cookies.")
+            )
+        else:
+            await interaction.followup.send(embed=err_embed("No playable results found."))
         return
 
     guild_id = interaction.guild.id
@@ -220,9 +236,10 @@ async def play(interaction: discord.Interaction, song_query: str):
     if already_active:
         if is_playlist:
             title = playlist_title or "Playlist"
+            extra = f"\nSkipped **{skipped_count}** unavailable/restricted track{'s' if skipped_count != 1 else ''}." if skipped_count else ""
             await interaction.followup.send(
                 embed=info_embed(
-                    f"Added **{len(tracks)}** tracks from **{title}** to the queue.",
+                    f"Added **{len(tracks)}** tracks from **{title}** to the queue.{extra}",
                     title="Added Playlist to Queue \U0001f3b6",
                 )
             )
@@ -240,6 +257,16 @@ async def play(interaction: discord.Interaction, song_query: str):
         current = now_playing.get(guild_id)
         if current:
             await interaction.followup.send(embed=make_now_playing_embed(current))
+            if is_playlist:
+                title = playlist_title or "Playlist"
+                queued_after_now_playing = max(len(tracks) - 1, 0)
+                extra = f"\nSkipped **{skipped_count}** unavailable/restricted track{'s' if skipped_count != 1 else ''}." if skipped_count else ""
+                await interaction.followup.send(
+                    embed=info_embed(
+                        f"Queued **{queued_after_now_playing}** more track{'s' if queued_after_now_playing != 1 else ''} from **{title}**.{extra}",
+                        title="Playlist Loaded",
+                    )
+                )
         else:
             await interaction.followup.send(embed=err_embed("Could not start playback."))
 
