@@ -10,7 +10,7 @@ import asyncio
 from collections import deque
 from urllib.parse import urlparse, parse_qs
 import db
-from embeds import make_now_playing_embed, ok_embed, info_embed, err_embed
+from embeds import make_now_playing_embed, make_added_to_queue_embed, ok_embed, info_embed, err_embed
 
 # Import Configs
 from config import TOKEN, GUILD_ID, FFMPEG_EXECUTABLE, FFMPEG_OPTIONS, YDL_OPTIONS
@@ -244,14 +244,9 @@ async def play(interaction: discord.Interaction, song_query: str):
                 )
             )
         else:
-            title = tracks[0]["title"]
+            track = tracks[0]
             position = len(queues[guild_id])
-            await interaction.followup.send(
-                embed=info_embed(
-                    f"Added **{title}** to the queue at position #{position}.",
-                    title="Added to Queue \U0001f3b6",
-                )
-            )
+            await interaction.followup.send(embed=make_added_to_queue_embed(track, position))
     else:
         await play_next(interaction.guild, send_notification=False)
         current = now_playing.get(guild_id)
@@ -302,11 +297,15 @@ async def queue_cmd(interaction: discord.Interaction):
 
     lines = []
     if current:
-        lines.append(f"\U0001f3b5 **Now playing:** {current['title']}")
+        video_url = current.get("video_url", "")
+        title_link = f"[{current['title']}]({video_url})" if video_url else current['title']
+        lines.append(f"\U0001f3b5 **Now playing:** {title_link}")
     if queue:
         lines.append(f"\n**Up next ({len(queue)} song{'s' if len(queue) != 1 else ''}):**")
         for i, track in enumerate(queue, start=1):
-            lines.append(f"`{i}.` {track['title']}")
+            video_url = track.get("video_url", "")
+            title_link = f"[{track['title']}]({video_url})" if video_url else track['title']
+            lines.append(f"`{i}.` {title_link}")
 
     await interaction.response.send_message(embed=info_embed("\n".join(lines), title="Queue \U0001f4c4"))
 

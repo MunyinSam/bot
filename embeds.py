@@ -8,7 +8,19 @@ def make_now_playing_embed(track: dict) -> discord.Embed:
                             color=discord.Color.blurple())
     embed.set_author(name="Now Playing \U0001f3b5")
     if track.get("thumbnail"):
-        embed.set_image(url=trackk["thumbnail"])
+        embed.set_image(url=track["thumbnail"])
+    return embed
+
+def make_added_to_queue_embed(track: dict, position: int) -> discord.Embed:
+    embed = discord.Embed(
+        title=track["title"],
+        url=track.get("video_url"),
+        description=f"Position in queue: **#{position}**",
+        color=discord.Color.blurple(),
+    )
+    embed.set_author(name="Added to Queue \U0001f3b6")
+    if track.get("thumbnail"):
+        embed.set_thumbnail(url=track["thumbnail"])
     return embed
 
 def ok_embed(description: str) -> discord.Embed:
