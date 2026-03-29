@@ -1,4 +1,5 @@
 import os
+import json
 import datetime as dt
 import discord
 from discord.ext import commands
@@ -9,11 +10,12 @@ from yt_dlp.utils import DownloadError
 import asyncio
 from collections import deque
 from urllib.parse import urlparse, parse_qs
+import redis.asyncio as aioredis
 import db
 from embeds import make_now_playing_embed, make_added_to_queue_embed, ok_embed, info_embed, err_embed
 
 # Import Configs
-from config import TOKEN, GUILD_ID, FFMPEG_EXECUTABLE, FFMPEG_OPTIONS, YDL_OPTIONS
+from config import TOKEN, GUILD_ID, FFMPEG_EXECUTABLE, FFMPEG_OPTIONS, YDL_OPTIONS, REDIS_URL, SESSION_NOTIFY_CHANNEL_ID
 
 
 # CONSTANTS
@@ -178,12 +180,60 @@ async def daily_reminder_loop(channel: discord.abc.Messageable, user_id: int, re
             continue
 
 
+# ── Session notification listener ─────────────────────────────────────────────
+
+def _format_duration(seconds: int) -> str:
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+async def session_listener():
+    r = aioredis.from_url(REDIS_URL, decode_responses=True)
+    channel = None
+    while True:
+        try:
+            if channel is None:
+                channel = bot.get_channel(SESSION_NOTIFY_CHANNEL_ID)
+            if channel is None:
+                channel = await bot.fetch_channel(SESSION_NOTIFY_CHANNEL_ID)
+            result = await r.blpop("session_saved", timeout=30)
+            if result is None:
+                continue
+            _, raw = result
+            payload = json.loads(raw)
+            user_name = payload.get("user_name") or "Unknown"
+            duration = _format_duration(int(payload.get("duration_sec", 0)))
+            ended_at = payload.get("ended_at", "")
+            description = payload.get("description") or ""
+            embed = discord.Embed(
+                title="📚 Study Session Saved",
+                description=description if description else discord.utils.MISSING,
+                color=0x5865F2,
+            )
+            embed.set_author(name=user_name)
+            embed.add_field(name="Duration", value=duration, inline=True)
+            if ended_at:
+                embed.add_field(name="Ended at", value=ended_at[:19].replace("T", " "), inline=True)
+            await channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            print(f"[session_listener] Discord error: {e}")
+        except Exception as e:
+            print(f"[session_listener] error: {e}")
+            await asyncio.sleep(5)
+
+
 # ── Bot events ────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
     test_guild = discord.Object(id=GUILD_ID)
     await bot.tree.sync(guild=test_guild)
+    asyncio.create_task(session_listener())
     print(f"{bot.user} is online")
 
 # ── Playback commands ─────────────────────────────────────────────────────────

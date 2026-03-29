@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+SESSION_NOTIFY_CHANNEL_ID = int(os.getenv("SESSION_NOTIFY_CHANNEL_ID"))
 FFMPEG_EXECUTABLE = os.getenv("FFMPEG_EXECUTABLE", "ffmpeg")
 
 FFMPEG_OPTIONS = {
