@@ -9,10 +9,12 @@ import yt_dlp
 from yt_dlp.utils import DownloadError
 import asyncio
 from collections import deque
+import random
 from urllib.parse import urlparse, parse_qs
 import redis.asyncio as aioredis
 import db
 from embeds import make_now_playing_embed, make_added_to_queue_embed, ok_embed, info_embed, err_embed
+from spotify_scraper import SpotifyClient
 
 # Import Configs
 from config import TOKEN, GUILD_ID, FFMPEG_EXECUTABLE, FFMPEG_OPTIONS, YDL_OPTIONS, REDIS_URL, SESSION_NOTIFY_CHANNEL_ID
@@ -33,6 +35,7 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+spotify_client = SpotifyClient()
 
 # BOT LOGIC
 
@@ -123,7 +126,9 @@ async def play_next(guild: discord.Guild, send_notification: bool = True):
             return
         refreshed = tracks[0]
         audio_url = refreshed.get("audio_url")
-        track["thumbnail"] = refreshed.get("thumbnail") # for picture
+        track["thumbnail"] = refreshed.get("thumbnail")
+        if refreshed.get("video_url"):
+            track["video_url"] = refreshed["video_url"]
 
         if not audio_url:
             await play_next(guild)
@@ -178,6 +183,56 @@ async def daily_reminder_loop(channel: discord.abc.Messageable, user_id: int, re
         except (discord.Forbidden, discord.HTTPException):
             # Keep the loop alive; the channel may become available again later.
             continue
+
+# Spotify Handling
+
+def is_spotify_link(url: str) -> bool:
+    return "open.spotify.com" in url
+
+
+def _make_spotify_stub(track_info: dict) -> dict:
+    artist = track_info["artists"][0]["name"] if track_info.get("artists") else "Unknown"
+    title = f"{artist} - {track_info['name']}"
+    return {"title": title, "audio_url": None, "video_url": f"ytsearch1:{title}", "thumbnail": None}
+
+
+async def _resolve_spotify_url(url: str) -> tuple[list[dict], str | None, bool]:
+    """Resolve a Spotify track/playlist/album URL into playable track stubs."""
+    loop = asyncio.get_running_loop()
+
+    def _scrape():
+        if "/track/" in url:
+            info = spotify_client.get_track_info(url)
+            return [_make_spotify_stub(info)], None, False
+
+        if "/playlist/" in url:
+            info = spotify_client.get_playlist_info(url)
+            raw_tracks = info.get("tracks", [])
+            # tracks may be a list or {"items": [...], "total": ...}
+            if isinstance(raw_tracks, dict):
+                raw_tracks = raw_tracks.get("items", [])
+            # each entry may be {"track": {...}} or the track dict directly
+            stubs = []
+            for item in raw_tracks:
+                if not item:
+                    continue
+                t = item.get("track", item) if isinstance(item, dict) and "track" in item else item
+                if t:
+                    stubs.append(_make_spotify_stub(t))
+            return stubs, info.get("name"), True
+
+        if "/album/" in url:
+            info = spotify_client.get_album_info(url)
+            stubs = [_make_spotify_stub(t) for t in info.get("tracks", []) if t]
+            return stubs, info.get("name"), True
+
+        return [], None, False
+
+    try:
+        return await loop.run_in_executor(None, _scrape)
+    except Exception as exc:
+        print(f"[Spotify] resolve error: {exc}")
+        return [], None, False
 
 
 # ── Session notification listener ─────────────────────────────────────────────
@@ -260,19 +315,26 @@ async def play(interaction: discord.Interaction, song_query: str):
     elif voice_channel != voice_client.channel:
         await voice_client.move_to(voice_channel)
     
-    is_url = song_query.startswith("http")
-    query = f"ytsearch1:{song_query}" if not is_url else song_query
-    allow_playlist = is_url and _is_playlist_url(song_query)
+    if is_spotify_link(song_query):
+        tracks, playlist_title, is_playlist = await _resolve_spotify_url(song_query)
+        skipped_count = 0
+        if not tracks:
+            await interaction.followup.send(embed=err_embed("Could not resolve Spotify link. Make sure it's a valid track, playlist, or album URL."))
+            return
+    else:
+        is_url = song_query.startswith("http")
+        query = f"ytsearch1:{song_query}" if not is_url else song_query
+        allow_playlist = is_url and _is_playlist_url(song_query)
 
-    tracks, playlist_title, is_playlist, skipped_count, fetch_error = await fetch_tracks(query, allow_playlist=allow_playlist)
-    if not tracks:
-        if fetch_error and ("confirm your age" in fetch_error.lower() or "sign in" in fetch_error.lower()):
-            await interaction.followup.send(
-                embed=err_embed("That video/playlist contains age-restricted content. I cannot access it without YouTube cookies.")
-            )
-        else:
-            await interaction.followup.send(embed=err_embed("No playable results found."))
-        return
+        tracks, playlist_title, is_playlist, skipped_count, fetch_error = await fetch_tracks(query, allow_playlist=allow_playlist)
+        if not tracks:
+            if fetch_error and ("confirm your age" in fetch_error.lower() or "sign in" in fetch_error.lower()):
+                await interaction.followup.send(
+                    embed=err_embed("That video/playlist contains age-restricted content. I cannot access it without YouTube cookies.")
+                )
+            else:
+                await interaction.followup.send(embed=err_embed("No playable results found."))
+            return
 
     guild_id = interaction.guild.id
     guild_text_channels[guild_id] = interaction.channel
@@ -315,6 +377,18 @@ async def play(interaction: discord.Interaction, song_query: str):
         else:
             await interaction.followup.send(embed=err_embed("Could not start playback."))
 
+@bot.tree.command(name="shuffle", description="Shuffle the queue")
+async def shuffle(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    queue = queues.get(guild_id)
+    if not queue or len(queue) < 2:
+        await interaction.response.send_message(embed=err_embed("Not enough songs in the queue to shuffle."))
+        return
+    items = list(queue)
+    random.shuffle(items)
+    queues[guild_id] = deque(items)
+    await interaction.response.send_message(embed=ok_embed(f"Shuffled **{len(items)}** songs in the queue. 🔀"))
+
 @bot.tree.command(name="skip", description="Skip the current song")
 async def skip(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
@@ -348,14 +422,22 @@ async def queue_cmd(interaction: discord.Interaction):
     lines = []
     if current:
         video_url = current.get("video_url", "")
-        title_link = f"[{current['title']}]({video_url})" if video_url else current['title']
+        title_link = f"[{current['title']}]({video_url})" if video_url and video_url.startswith("http") else current['title']
         lines.append(f"\U0001f3b5 **Now playing:** {title_link}")
     if queue:
         lines.append(f"\n**Up next ({len(queue)} song{'s' if len(queue) != 1 else ''}):**")
+        shown = 0
         for i, track in enumerate(queue, start=1):
             video_url = track.get("video_url", "")
-            title_link = f"[{track['title']}]({video_url})" if video_url else track['title']
-            lines.append(f"`{i}.` {title_link}")
+            title_link = f"[{track['title']}]({video_url})" if video_url and video_url.startswith("http") else track['title']
+            line = f"`{i}.` {title_link}"
+            # Leave room for the "and X more" footer (~50 chars)
+            if len("\n".join(lines)) + len(line) + 50 > 4096:
+                remaining = len(queue) - shown
+                lines.append(f"*... and {remaining} more*")
+                break
+            lines.append(line)
+            shown += 1
 
     await interaction.response.send_message(embed=info_embed("\n".join(lines), title="Queue \U0001f4c4"))
 

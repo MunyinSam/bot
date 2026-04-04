@@ -2,9 +2,14 @@
 import discord
 import asyncio
 
+def _safe_url(url: str | None) -> str | None:
+    if url and url.startswith(("http://", "https://")):
+        return url
+    return None
+
 def make_now_playing_embed(track: dict) -> discord.Embed:
     embed = discord.Embed(title=track["title"],
-                            url=track.get("video_url"),
+                            url=_safe_url(track.get("video_url")),
                             color=discord.Color.blurple())
     embed.set_author(name="Now Playing \U0001f3b5")
     if track.get("thumbnail"):
@@ -14,7 +19,7 @@ def make_now_playing_embed(track: dict) -> discord.Embed:
 def make_added_to_queue_embed(track: dict, position: int) -> discord.Embed:
     embed = discord.Embed(
         title=track["title"],
-        url=track.get("video_url"),
+        url=_safe_url(track.get("video_url")),
         description=f"Position in queue: **#{position}**",
         color=discord.Color.blurple(),
     )

@@ -54,3 +54,7 @@ Playlists are saved permanently in the database and shared across the whole serv
 | `/playlist view <name>` | Show all songs in a playlist with their position numbers and durations. |
 | `/playlist remove <name> <position>` | Remove a song from a playlist by its position number (use `/playlist view` to find it). |
 | `/playlist delete <name>` | Permanently delete a playlist. Only the person who created it can do this. |
+
+dc_env\Scripts\activate
+
+https://mermaid.ai/app/projects/a1eda080-c87c-4942-bd73-292b20e25d1f/diagrams/60d03854-83cd-4b17-9976-0b7d03a6c130/share/invite/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkb2N1bWVudElEIjoiNjBkMDM4NTQtODNjZC00YjE3LTk5NzYtMGI3ZDAzYTZjMTMwIiwiYWNjZXNzIjoiVmlldyIsImlhdCI6MTc3NTI4MjQzM30.Wb9OilRR8jP1DnKDEYB53dhC-4o6B2isda1UxCiM8TA
