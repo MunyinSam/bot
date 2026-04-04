@@ -12,6 +12,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Copy env file
+        run: cp /home/munyin/Prod/bot/.env $GITHUB_WORKSPACE/.env
+
       - name: Deploy with Docker Compose
         run: |
           docker compose down
