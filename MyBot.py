@@ -290,6 +290,31 @@ async def session_listener():
             await asyncio.sleep(5)
 
 
+async def session_start_listener():
+    r = aioredis.from_url(REDIS_URL, decode_responses=True)
+    channel = None
+    while True:
+        try:
+            if channel is None:
+                channel = bot.get_channel(SESSION_NOTIFY_CHANNEL_ID)
+            if channel is None:
+                channel = await bot.fetch_channel(SESSION_NOTIFY_CHANNEL_ID)
+            result = await r.blpop("session_start", timeout=30)
+            if result is None:
+                continue
+            _, raw = result
+            payload = json.loads(raw)
+            user_name = payload.get("user_name") or "Unknown"
+            description = payload.get("description") or ""
+            session_label = f"**{description}**" if description else "a study"
+            await channel.send(f"**{user_name}** has started {session_label} session 📖")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            print(f"[session_start_listener] Discord error: {e}")
+        except Exception as e:
+            print(f"[session_start_listener] error: {e}")
+            await asyncio.sleep(5)
+
+
 # ── Bot events ────────────────────────────────────────────────────────────────
 
 @bot.event
@@ -297,6 +322,7 @@ async def on_ready():
     test_guild = discord.Object(id=GUILD_ID)
     await bot.tree.sync(guild=test_guild)
     asyncio.create_task(session_listener())
+    asyncio.create_task(session_start_listener())
     print(f"{bot.user} is online")
 
 # ── Playback commands ─────────────────────────────────────────────────────────
