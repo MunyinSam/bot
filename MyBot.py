@@ -1,5 +1,7 @@
 import os
 import json
+import tempfile
+import time
 import datetime as dt
 import discord
 from discord.ext import commands
@@ -15,6 +17,12 @@ import redis.asyncio as aioredis
 import db
 from embeds import make_now_playing_embed, make_added_to_queue_embed, ok_embed, info_embed, err_embed
 from spotify_scraper import SpotifyClient
+
+try:
+    import whisper as _whisper
+    _whisper_model = _whisper.load_model("base")
+except ImportError:
+    _whisper_model = None
 
 # Import Configs
 from config import TOKEN, GUILD_ID, FFMPEG_EXECUTABLE, FFMPEG_OPTIONS, YDL_OPTIONS, REDIS_URL, SESSION_NOTIFY_CHANNEL_ID
@@ -476,6 +484,141 @@ async def reminder(interaction: discord.Interaction, reminder: str, time: str):
         embed=ok_embed(f"Daily reminder saved for **{time}**: {reminder}"),
         ephemeral=True,
     )
+
+
+# ── Voice recording ───────────────────────────────────────────────────────────
+
+# guild_id -> {user_id, start_time, text_channel}
+_active_recordings: dict[int, dict] = {}
+
+
+async def _recording_finished(sink: discord.sinks.WaveSink, guild_id: int):
+    meta = _active_recordings.pop(guild_id, None)
+    if meta is None:
+        return
+
+    user_id: int = meta["user_id"]
+    start_time: float = meta["start_time"]
+    text_channel: discord.TextChannel = meta["text_channel"]
+    duration = time.monotonic() - start_time
+
+    audio_data = sink.audio_data.get(user_id)
+    if not audio_data:
+        await text_channel.send(embed=err_embed("No audio captured — make sure you were speaking."))
+        return
+
+    if _whisper_model is None:
+        await text_channel.send(embed=err_embed(
+            "Whisper is not installed. Run `pip install openai-whisper` to enable transcription."
+        ))
+        return
+
+    await text_channel.send(embed=info_embed("Transcribing your audio... ⏳", title="Processing"))
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        f.write(audio_data.file.read())
+        tmp_path = f.name
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: _whisper_model.transcribe(tmp_path, language="th"))
+        transcript = result["text"].strip()
+    finally:
+        os.unlink(tmp_path)
+
+    db.save_voice_session(user_id, guild_id, duration, transcript)
+
+    word_count = len(transcript.split()) if transcript else 0
+    wpm = round((word_count / duration) * 60) if duration > 0 else 0
+    preview = f"> {transcript[:400]}" if transcript else "> *(silence or no speech detected)*"
+
+    embed = discord.Embed(title="Recording Saved", color=0x57F287)
+    embed.add_field(name="Duration", value=f"{duration:.0f}s", inline=True)
+    embed.add_field(name="Words", value=str(word_count), inline=True)
+    embed.add_field(name="WPM", value=str(wpm), inline=True)
+    embed.add_field(name="Transcript", value=preview, inline=False)
+    await text_channel.send(embed=embed)
+
+
+@bot.tree.command(name="record", description="Start or stop recording your voice for habit tracking")
+@app_commands.describe(action="start or stop")
+@app_commands.choices(action=[
+    app_commands.Choice(name="start", value="start"),
+    app_commands.Choice(name="stop", value="stop"),
+])
+async def record(interaction: discord.Interaction, action: str):
+    guild_id = interaction.guild.id
+
+    if action == "start":
+        if interaction.user.voice is None:
+            await interaction.response.send_message(embed=err_embed("Join a voice channel first."), ephemeral=True)
+            return
+        if guild_id in _active_recordings:
+            await interaction.response.send_message(embed=err_embed("Already recording. Use `/record stop` first."), ephemeral=True)
+            return
+
+        vc = interaction.guild.voice_client
+        voice_channel = interaction.user.voice.channel
+        if vc is None:
+            vc = await voice_channel.connect()
+        elif vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
+
+        _active_recordings[guild_id] = {
+            "user_id": interaction.user.id,
+            "start_time": time.monotonic(),
+            "text_channel": interaction.channel,
+        }
+        vc.start_recording(
+            discord.sinks.WaveSink(),
+            _recording_finished,
+            guild_id,
+        )
+        await interaction.response.send_message(embed=ok_embed("Recording started. Use `/record stop` when you're done. 🎙️"))
+
+    elif action == "stop":
+        if guild_id not in _active_recordings:
+            await interaction.response.send_message(embed=err_embed("No active recording. Use `/record start` first."), ephemeral=True)
+            return
+        vc = interaction.guild.voice_client
+        if vc is None:
+            _active_recordings.pop(guild_id, None)
+            await interaction.response.send_message(embed=err_embed("No voice client found."), ephemeral=True)
+            return
+        vc.stop_recording()  # triggers _recording_finished
+        await interaction.response.send_message(embed=ok_embed("Stopped recording. Processing..."))
+
+
+@bot.tree.command(name="habits", description="View your voice speaking stats and recent transcripts")
+async def habits(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    guild_id = interaction.guild.id
+
+    stats = db.get_voice_stats(user_id, guild_id)
+    recent = db.get_voice_habits(user_id, guild_id, limit=3)
+
+    if stats["sessions"] == 0:
+        await interaction.response.send_message(embed=info_embed("No recordings yet. Use `/record start` to begin.", title="Your Speaking Habits"))
+        return
+
+    total_min = int(stats["total_sec"] // 60)
+    avg_wpm = round((stats["total_words"] / stats["total_sec"]) * 60) if stats["total_sec"] > 0 else 0
+
+    embed = discord.Embed(title="Your Speaking Habits 🎙️", color=0x5865F2)
+    embed.add_field(name="Sessions", value=str(stats["sessions"]), inline=True)
+    embed.add_field(name="Total Time", value=f"{total_min}m", inline=True)
+    embed.add_field(name="Avg WPM", value=str(avg_wpm), inline=True)
+
+    for row in recent:
+        transcript_preview = (row["transcript"] or "*(no transcript)*")[:120]
+        duration = f"{row['duration_sec']:.0f}s"
+        embed.add_field(
+            name=f"{row['recorded_at'][:16]}  •  {duration}  •  {row['word_count']} words",
+            value=f"> {transcript_preview}",
+            inline=False,
+        )
+
+    await interaction.response.send_message(embed=embed)
 
 
 bot.run(TOKEN)
