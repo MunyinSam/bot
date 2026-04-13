@@ -315,6 +315,71 @@ async def session_start_listener():
             await asyncio.sleep(5)
 
 
+async def exercise_listener():
+    r = aioredis.from_url(REDIS_URL, decode_responses=True)
+    channel = None
+    while True:
+        try:
+            if channel is None:
+                channel = bot.get_channel(SESSION_NOTIFY_CHANNEL_ID)
+            if channel is None:
+                channel = await bot.fetch_channel(SESSION_NOTIFY_CHANNEL_ID)
+            result = await r.blpop("exercise_saved", timeout=30)
+            if result is None:
+                continue
+            _, raw = result
+            payload = json.loads(raw)
+            user_name     = payload.get("user_name") or "Unknown"
+            duration      = _format_duration(int(payload.get("duration_sec", 0)))
+            ended_at      = payload.get("ended_at", "")
+            description   = payload.get("description") or ""
+            exercise_type = payload.get("exercise_type") or "Workout"
+            sets_count    = int(payload.get("sets_count", 0))
+            embed = discord.Embed(
+                title="💪 Workout Saved",
+                description=description if description else discord.utils.MISSING,
+                color=0xe07820,
+            )
+            embed.set_author(name=user_name)
+            embed.add_field(name="Type", value=exercise_type, inline=True)
+            embed.add_field(name="Duration", value=duration, inline=True)
+            if sets_count > 0:
+                embed.add_field(name="Sets", value=str(sets_count), inline=True)
+            if ended_at:
+                embed.add_field(name="Ended at", value=ended_at[:19].replace("T", " "), inline=True)
+            await channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            print(f"[exercise_listener] Discord error: {e}")
+        except Exception as e:
+            print(f"[exercise_listener] error: {e}")
+            await asyncio.sleep(5)
+
+
+async def exercise_start_listener():
+    r = aioredis.from_url(REDIS_URL, decode_responses=True)
+    channel = None
+    while True:
+        try:
+            if channel is None:
+                channel = bot.get_channel(SESSION_NOTIFY_CHANNEL_ID)
+            if channel is None:
+                channel = await bot.fetch_channel(SESSION_NOTIFY_CHANNEL_ID)
+            result = await r.blpop("exercise_start", timeout=30)
+            if result is None:
+                continue
+            _, raw = result
+            payload       = json.loads(raw)
+            user_name     = payload.get("user_name") or "Unknown"
+            exercise_type = payload.get("exercise_type") or ""
+            type_label    = f"**{exercise_type}**" if exercise_type else "a workout"
+            await channel.send(f"**{user_name}** has started {type_label} session 🏋️")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            print(f"[exercise_start_listener] Discord error: {e}")
+        except Exception as e:
+            print(f"[exercise_start_listener] error: {e}")
+            await asyncio.sleep(5)
+
+
 # ── Bot events ────────────────────────────────────────────────────────────────
 
 @bot.event
@@ -323,6 +388,8 @@ async def on_ready():
     await bot.tree.sync(guild=test_guild)
     asyncio.create_task(session_listener())
     asyncio.create_task(session_start_listener())
+    asyncio.create_task(exercise_listener())
+    asyncio.create_task(exercise_start_listener())
     print(f"{bot.user} is online")
 
 # ── Playback commands ─────────────────────────────────────────────────────────
