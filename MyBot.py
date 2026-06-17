@@ -17,6 +17,7 @@ import redis.asyncio as aioredis
 import db
 from embeds import make_now_playing_embed, make_added_to_queue_embed, ok_embed, info_embed, err_embed
 from spotify_scraper import SpotifyClient
+from modal import ContractModal
 
 try:
     import whisper as _whisper
@@ -576,6 +577,12 @@ async def reminder(interaction: discord.Interaction, reminder: str, time: str):
     await interaction.response.send_message(
         embed=ok_embed(f"Daily reminder saved for **{time}**: {reminder}"),
         ephemeral=True,
+    )
+
+@bot.tree.command(name="contract")
+async def contract(interaction: discord.Interaction):
+    await interaction.response.send_modal(
+        ContractModal()
     )
 
 
