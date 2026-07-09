@@ -1,15 +1,7 @@
 services:
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-
   bot:
     build: .
     restart: unless-stopped
-    depends_on:
-      - redis
     volumes:
       - ./data:/app/data       # persists bot.db across restarts
     environment:
@@ -17,6 +9,6 @@ services:
       - GUILD_ID=${GUILD_ID}
       - DATA_DIR=/app/data
       - FFMPEG_EXECUTABLE=ffmpeg
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=redis://:a3dbdb2248225f3658fb1f0e679f5bf912240bcaed632034@host.docker.internal:6379
     env_file:
       - .env
